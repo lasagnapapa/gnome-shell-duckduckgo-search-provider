@@ -1,173 +1,165 @@
-declare const global: {
-  log(message: string): void,
-  create_app_launch_context(
-    timestamp: number,
-    workspace: number,
-  ): ApplicationLaunchContext;
-  display: {
-    get_current_time_roundtrip(): number;
-  };
-};
-declare const imports: {
-  gi: {
-    Gio: {
-      icon_new_for_string(name: string): GioIcon;
-      app_info_launch_default_for_uri(
-        uri: string,
-        launchContext: ApplicationLaunchContext,
-      ): any;
-    };
-    Soup: {
-      URI: typeof SoupURI;
-      Session: typeof SoupSession;
-      form_request_new_from_hash(
-        method: string,
-        uri: string,
-        form_data_set: Record<string, string>,
-      ): SoupMessage;
-    };
-  };
-  ui: {
-    main: {
-      overview: {
-        viewSelector: {
-          _searchResults: {
-            _registerProvider(provider: SearchProvider): void
-            _unregisterProvider(provider: SearchProvider): void
-          }
-        },
-        _overview: {
-          controls: {
-            _searchController: {
-              _searchResults: {
-                _registerProvider(provider: SearchProvider): void
-                _unregisterProvider(provider: SearchProvider): void
-              }
+const { Gio, Soup } = imports.gi;
+const { main, overview } = imports.ui;
+const Me = imports.misc.extensionUtils.getCurrentExtension();
+const gicon = Gio.icon_new_for_string(`${Me.dir.get_path()}/logo.svg`);
+
+const getJSON = (() => {
+    let httpSession;
+    return (url, params) =>
+        new Promise((resolve, reject) => {
+            try {
+                if (!httpSession) {
+                    httpSession = new Soup.Session();
+                    httpSession.user_agent = "Gnome Shell Extension";
+                } else {
+                    httpSession.abort();
+                }
+                const message = Soup.form_request_new_from_hash("GET", url, params);
+                httpSession.queue_message(message, () => {
+                    try {
+                        if (!message.response_body.data) {
+                            return reject(new Error("No data in response body"));
+                        }
+                        resolve(JSON.parse(message.response_body.data));
+                    } catch (e) {
+                        reject(e);
+                    }
+                });
+            } catch (e) {
+                reject(e);
             }
-          }
+        });
+})();
+
+function getIA(q) {
+    return getJSON("https://api.duckduckgo.com/", {
+        q,
+        format: "json",
+        pretty: "0",
+        no_redirect: "1",
+        t: "gnome-shell-search-extension",
+    });
+}
+
+function getSuggestions(q) {
+    return getJSON("https://duckduckgo.com/ac/", { q, t: "gnome-shell-search-extension" });
+}
+
+function getResultMeta(id) {
+    const { type, answer, query } = JSON.parse(id);
+    if (type === "suggestion") {
+        return {
+            id,
+            name: answer,
+            description: "Suggested result",
+            clipboardText: answer,
+            createIcon() {
+                return null;
+            },
+        };
+    } else if (type === "bang") {
+        const uri = new Soup.URI(answer);
+        return {
+            id,
+            name: `Search ${uri.get_host()} for ${query}`,
+            description: "!bang Redirect",
+            clipboardText: answer,
+            createIcon() {
+                return null;
+            },
+        };
+    }
+    return {
+        id,
+        name: answer,
+        description: "Search DuckDuckGo",
+        clipboardText: answer,
+        createIcon() {
+            return null;
+        },
+    };
+}
+
+function makeLaunchContext() {
+    return global.create_app_launch_context(global.display.get_current_time_roundtrip(), -1);
+}
+
+const ddgProvider = {
+    appInfo: {
+        get_name: () => "DuckDuckGo",
+        get_icon: () => gicon,
+        get_id: () => "duckduckgo-provider",
+        should_show: () => true,
+    },
+
+    getResultMetas(results, cb) {
+        cb(results.map(getResultMeta));
+    },
+
+    activateResult(result) {
+        const { type, answer } = JSON.parse(result);
+        let url = "";
+        if (type === "suggestion" || type === "query") {
+            url = `https://duckduckgo.com/?q=${answer}`;
+        } else if (type === "bang") {
+            url = answer;
         }
-      }
-    };
-  };
-  misc: {
-    extensionUtils: {
-      getCurrentExtension(): Extension;
-    };
-  };
+        if (url) Gio.app_info_launch_default_for_uri(url, makeLaunchContext());
+    },
+
+    filterResults(providerResults, maxResults) {
+        return providerResults.slice(0, maxResults);
+    },
+
+    async getInitialResultSet(terms, cb) {
+        const query = terms.join(" ");
+        const results = [JSON.stringify({ type: "query", answer: query })];
+        if (query[0] === "!") {
+            const ia = await getIA(query);
+            if (ia.Type === "E" && ia.Redirect) {
+                results.unshift(
+                    JSON.stringify({
+                        type: "bang",
+                        answer: ia.Redirect,
+                        query: terms.slice(1).join(" "),
+                    })
+                );
+                return cb(results);
+            }
+        }
+        for (const { phrase } of await getSuggestions(query)) {
+            if (phrase === query) continue;
+            results.push(
+                JSON.stringify({ type: "suggestion", answer: phrase, query })
+            );
+        }
+        global.log(`DDG Results: [${results.join(",")}]`);
+        cb(results);
+    },
+
+    getSubsearchResultSet(_, terms, cb) {
+        this.getInitialResultSet(terms, cb);
+    },
 };
 
-declare class Extension {
-  dir: {
-    get_path(): string;
-  };
+function getOverviewSearchResult() {
+    if (main.overview.viewSelector !== undefined) {
+        return main.overview.viewSelector._searchResults;
+    } else {
+        return main.overview._overview.controls._searchController._searchResults;
+    }
 }
 
-declare class SoupURI {
-  get_host(): string;
-  constructor(uri: string);
+export function init() {}
+
+let instance;
+export function enable() {
+    global.log("Enabling DuckDuckGo IA Search Provider");
+    instance = Object.create(ddgProvider);
+    getOverviewSearchResult()._registerProvider(instance);
 }
 
-declare class SoupSession {
-  user_agent: string;
-  queue_message(
-    message: SoupMessage,
-    cb: (session: SoupSession, message: SoupMessage) => void,
-  ): void;
-}
-
-declare interface SoupMessage {
-  response_body: {
-    data: string;
-  };
-}
-
-declare interface ApplicationLaunchContext {}
-
-declare interface GioIcon {}
-
-declare interface SearchResultMeta {
-  id: string;
-  name: string;
-  description?: string;
-  clipboardText?: string;
-  createIcon: (size: number) => GioIcon|null
-}
-
-declare interface SearchProvider {
-  appInfo?: {get_name(): string; get_icon(): GioIcon; get_id(): string, should_show(): boolean};
-  createResultObject?(metaInfo: SearchResultMeta, resultsView: any): any;
-  getResultMetas(
-    resultIds: string[],
-    callback: (results: SearchResultMeta[]) => void,
-  ): void;
-  getInitialResultSet(
-    terms: string[],
-    callback: (results: string[]) => void,
-  ): void;
-  getSubsearchResultSet(
-    previousResults: string[],
-    terms: string[],
-    callback: (results: string[]) => void,
-  ): void;
-  filterResults(results: string[], maxNumber: number): string[];
-  activateResult(id: string): void;
-}
-
-declare interface SearchAnswer {
-  type: string;
-  answer: string;
-  query: string;
-}
-
-/* DDG APIs */
-declare interface DDGIcon {
-  URL: string;
-  Width: string;
-  Height: string;
-}
-
-declare interface DDGResult {
-  Result: string;
-  FirstURL: string;
-  Icon: DDGIcon;
-  Text: string;
-}
-
-declare interface DDGInstantAnswer {
-  Abstract: string;
-  AbstractText: string;
-  AbstractSource: string;
-  AbstractURL: string;
-  Image: string;
-  Heading: string;
-  Answer: string;
-  Redirect: string;
-  AnswerType:
-    | "calc"
-    | "color"
-    | "digest"
-    | "info"
-    | "ip"
-    | "iploc"
-    | "phone"
-    | "pw"
-    | "rand"
-    | "regexp"
-    | "unicode"
-    | "upc"
-    | "zip";
-  Definition: string;
-  DefinitionSource: string;
-  RelatedTopics: DDGResult[];
-  Results: DDGResult[];
-  Type:
-    | "A" // Answer
-    | "D" // Disambiguation
-    | "C" // Category
-    | "N" // Name
-    | "E"; // Exclusive
-}
-
-declare interface DDGSuggestion {
-  phrase: string;
+export function disable() {
+    global.log("Disabling DuckDuckGo IA Search Provider");
+    getOverviewSearchResult()._unregisterProvider(instance);
 }
